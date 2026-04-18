@@ -3,3 +3,6 @@ uvicorn==0.30.0
 psycopg[binary]==3.2.1
 pandas==2.2.2
 openai==1.40.0
+requests
+sentence-transformers
+torch
