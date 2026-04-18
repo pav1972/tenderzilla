@@ -1,0 +1,263 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <title>TenderWise</title>
+    <link rel="stylesheet" href="styles.css" />
+  </head>
+
+  <body>
+    <header class="header">
+      <div class="header-inner">
+        <div class="logo">TenderWise</div>
+      </div>
+    </header>
+
+    <div class="container">
+      <!-- SIDEBAR -->
+      <aside class="sidebar">
+        <!-- TENDER FILTERS -->
+        <div class="section">
+          <div class="section-title company-title">Tender filters</div>
+
+          <div class="tag-section">
+            <label class="tag-label" for="industryFocusInput"
+              >Industry focus:</label
+            >
+            <div class="tag-editor" id="industryFocusDropdownWrapper">
+              <div class="tags-container" id="industryFocusTags"></div>
+
+              <select id="industryFocusSelect" class="tag-input">
+                <option value="" selected disabled>Select industry</option>
+                <option value="IT / Software">IT / Software</option>
+                <option value="Telecom / Connectivity">
+                  Telecom / Connectivity
+                </option>
+                <option value="Engineering / Technical">
+                  Engineering / Technical
+                </option>
+                <option value="Construction / Works">
+                  Construction / Works
+                </option>
+                <option value="Healthcare">Healthcare</option>
+                <option value="Education / Training">
+                  Education / Training
+                </option>
+                <option value="Transport / Logistics">
+                  Transport / Logistics
+                </option>
+                <option value="Cleaning / Facilities">
+                  Cleaning / Facilities
+                </option>
+                <option value="Waste / Environmental">
+                  Waste / Environmental
+                </option>
+                <option value="Legal / Professional Services">
+                  Legal / Professional Services
+                </option>
+                <option value="Other">Other</option>
+              </select>
+            </div>
+          </div>
+
+          <div class="tag-section">
+            <label class="tag-label" for="preferredRegionsSelect"
+              >Preferred regions:</label
+            >
+
+            <div class="tag-editor" id="preferredRegionsDropdownWrapper">
+              <div class="tags-container" id="preferredRegionsTags"></div>
+
+              <select id="preferredRegionsSelect" class="tag-input">
+                <option value="" selected disabled>Select region</option>
+                <option value="UK">UK</option>
+                <option value="Europe ex-UK">Europe ex-UK</option>
+                <option value="World ex-Europe, UK">World ex-Europe, UK</option>
+                <option value="Whole world">Whole world</option>
+              </select>
+            </div>
+          </div>
+
+          <div class="tag-section">
+            <label class="tag-label" for="acceptableMinValue">
+              Acceptable min tender value
+            </label>
+            <input id="acceptableMinValue" type="number" min="0" step="1" />
+          </div>
+
+          <div class="tag-section closing-row">
+            <label class="tag-label inline-label" for="days"
+              >Closing within</label
+            >
+            <input id="days" class="inline" type="number" min="0" step="1" />
+            <span class="inline-suffix">days</span>
+          </div>
+        </div>
+
+        <!-- COMPANY MATCHING PROFILE -->
+        <div class="section">
+          <div class="section-title company-title">Company capabilities</div>
+
+          <div class="tag-section">
+            <div class="tag-label-row">
+              <label class="tag-label" for="coreCapabilitiesInput"
+                >Core capabilities:</label
+              >
+              <button
+                type="button"
+                class="help-trigger"
+                aria-label="Help for Core capabilities"
+                data-help="Add your company’s main service capabilities. These should describe the primary areas of work you want to match against tenders, for example cloud infrastructure, telecom networks, fibre, broadband, managed services, cybersecurity, software development, systems integration, technical support, migration"
+              >
+                ?
+              </button>
+            </div>
+            <div class="tag-editor" data-editor="core_capabilities">
+              <div class="tags-container" id="coreCapabilitiesTags"></div>
+              <input
+                id="coreCapabilitiesInput"
+                class="tag-input"
+                type="text"
+                placeholder="Type and press Enter"
+              />
+            </div>
+          </div>
+
+          <div class="tag-section">
+            <div class="tag-label-row">
+              <label class="tag-label" for="technologiesVendorsInput"
+                >Technologies/vendors:</label
+              >
+              <button
+                type="button"
+                class="help-trigger"
+                aria-label="Help for Technologies/vendors"
+                data-help="Add specific technologies, platforms, brands, vendors relevant to your business, for example Azure, Cisco, AWS, Microsoft, Oracle."
+              >
+                ?
+              </button>
+            </div>
+            <div class="tag-editor" data-editor="technologies_vendors">
+              <div class="tags-container" id="technologiesVendorsTags"></div>
+              <input
+                id="technologiesVendorsInput"
+                class="tag-input"
+                type="text"
+                placeholder="Type and press Enter"
+              />
+            </div>
+          </div>
+
+          <div class="tag-section">
+            <div class="tag-label-row">
+              <label class="tag-label" for="secondaryCapabilitiesInput"
+                >Secondary capabilities:</label
+              >
+              <button
+                type="button"
+                class="help-trigger"
+                aria-label="Help for Secondary capabilities"
+                data-help="Add related but less central capabilities that strengthen relevance, but are not your company’s core focus, for example planning, architecture, compliance"
+              >
+                ?
+              </button>
+            </div>
+            <div class="tag-editor" data-editor="secondary_capabilities">
+              <div class="tags-container" id="secondaryCapabilitiesTags"></div>
+              <input
+                id="secondaryCapabilitiesInput"
+                class="tag-input"
+                type="text"
+                placeholder="Type and press Enter"
+              />
+            </div>
+          </div>
+        </div>
+
+        <button id="updateBtn" class="btn">Update</button>
+
+        <section class="alert-card" aria-labelledby="alertCardTitle">
+          <div class="alert-card-header">
+            <div id="alertCardTitle" class="alert-card-title">Tender alerts</div>
+            <div class="alert-card-subtitle">Get matching tenders by email</div>
+          </div>
+
+          <label class="alert-check">
+            <input id="alertsEnabled" type="checkbox" />
+            <span>Enable alerts</span>
+          </label>
+
+          <div class="alert-field">
+            <label class="tag-label" for="matchThreshold">Match threshold</label>
+            <div class="alert-inline-control">
+              <input id="matchThreshold" type="number" min="0" max="100" step="1" value="60" />
+              <span class="inline-suffix">%</span>
+            </div>
+          </div>
+
+          <div class="alert-field">
+            <label class="tag-label" for="recipientEmail">Recipient email</label>
+            <input
+              id="recipientEmail"
+              class="alert-input"
+              type="email"
+              placeholder="name@example.com"
+            />
+          </div>
+
+          <div class="alert-field">
+            <label class="tag-label" for="deliveryMode">Delivery mode</label>
+            <select id="deliveryMode" class="alert-input">
+              <option value="daily">Daily</option>
+              <option value="weekly">Weekly</option>
+            </select>
+          </div>
+
+          <label class="alert-check">
+            <input id="onlyNewTenders" type="checkbox" />
+            <span>Only send new tenders</span>
+          </label>
+
+          <label class="alert-check">
+            <input id="includeTenderSource" type="checkbox" />
+            <span>Include tender source link</span>
+          </label>
+
+          <button type="button" class="btn alert-save-btn">Save alert settings</button>
+        </section>
+      </aside>
+
+      <!-- MAIN -->
+      <main class="main">
+        <div class="results-header">
+          <div class="results-title" id="resultsCount">Results (0)</div>
+
+          <div class="sort">
+            <span>Sort by:</span>
+            <select id="sortSelect">
+              <option value="relevance">Relevance</option>
+              <option value="deadline">Closing date</option>
+            </select>
+          </div>
+        </div>
+
+        <div id="resultsGrid"></div>
+      </main>
+    </div>
+
+    <!-- DRAWER -->
+    <div class="drawer" id="drawer">
+      <div class="drawer-header drawer-header-row">
+        <span id="drawerTitle"></span>
+        <button id="closeDrawer" class="close-btn" aria-label="Close drawer">
+          ✕
+        </button>
+      </div>
+      <div id="drawerBody"></div>
+    </div>
+
+    <div class="overlay" id="overlay"></div>
+
+    <script src="app.js"></script>
+  </body>
+</html>
