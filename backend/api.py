@@ -286,7 +286,125 @@ def apply_stage_a_filters(tenders: list[dict], company_profile: dict) -> list[di
     return filtered
 
 
-# TODO: re-enable vector ranking endpoint after DB and imports are verified safe on Render.
+def upsert_company_profile(profile_name: str, profile_data: dict) -> None:
+    try:
+        from .embedding_model import MODEL_NAME, embed_text
+        from .profile_serializer import build_profile_text
+    except ImportError:
+        from embedding_model import MODEL_NAME, embed_text
+        from profile_serializer import build_profile_text
+
+    profile_text = build_profile_text(profile_data)
+    vector = embed_text(profile_text)
+
+    conn = get_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO company_profiles (
+                    profile_name,
+                    profile_text,
+                    embedding_model,
+                    embedding,
+                    updated_at
+                )
+                VALUES (%s, %s, %s, %s, NOW())
+                ON CONFLICT (profile_name)
+                DO UPDATE SET
+                    profile_text = EXCLUDED.profile_text,
+                    embedding_model = EXCLUDED.embedding_model,
+                    embedding = EXCLUDED.embedding,
+                    updated_at = NOW()
+                """,
+                (
+                    profile_name,
+                    profile_text,
+                    MODEL_NAME,
+                    vector,
+                ),
+            )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def fetch_ranked_tenders(profile_name: str, limit: int = 200) -> list[dict]:
+    conn = get_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT
+                    p.ocid,
+                    p.title,
+                    p.description,
+                    p.buyer_name,
+                    p.latest_notice_type,
+                    p.deadline,
+                    p.value_amount,
+                    p.value_currency,
+                    p.value_amount AS value,
+                    p.cpv_code,
+                    p.cpv_description,
+                    p.region,
+                    p.submission_url,
+                    1 - (pe.embedding <=> cp.embedding) AS semantic_similarity
+                FROM procurements p
+                JOIN procurement_embeddings pe
+                  ON pe.ocid = p.ocid
+                JOIN company_profiles cp
+                  ON cp.profile_name = %s
+                WHERE p.is_live = TRUE
+                  AND pe.embedding IS NOT NULL
+                  AND cp.embedding IS NOT NULL
+                ORDER BY pe.embedding <=> cp.embedding
+                LIMIT %s
+                """,
+                (profile_name, limit),
+            )
+            rows = cur.fetchall()
+            columns = [d.name for d in cur.description]
+    finally:
+        conn.close()
+
+    return [dict(zip(columns, row)) for row in rows]
+
+
+def enrich_tender_with_score(tender: dict, company_profile: dict) -> dict:
+    try:
+        from .pre_score_v2 import compute_pre_score_v2
+    except ImportError:
+        from pre_score_v2 import compute_pre_score_v2
+
+    similarity = float(tender.get("semantic_similarity") or 0)
+
+    scored = compute_pre_score_v2(
+        tender=tender,
+        company_profile=company_profile,
+        semantic_similarity=similarity,
+    )
+
+    tender["pre_score_v2"] = scored["pre_score_v2"]
+    tender["fit_band"] = scored.get("fit_band")
+    tender["pre_score_breakdown"] = scored["breakdown"]
+    tender["notes"] = scored["notes"]
+    tender["matched_core_capabilities"] = scored.get(
+        "matched_core_capabilities", []
+    )
+    tender["matched_secondary_capabilities"] = scored.get(
+        "matched_secondary_capabilities", []
+    )
+    tender["matched_industry_focus"] = scored.get(
+        "matched_industry_focus", []
+    )
+    tender["matched_technologies_vendors"] = scored.get(
+        "matched_technologies_vendors", []
+    )
+    tender["matched_regions"] = scored.get("matched_regions", [])
+    tender["triggered_exclusions"] = scored.get("triggered_exclusions", [])
+
+    return tender
 
 
 # -----------------------------
@@ -359,3 +477,32 @@ def get_tenders_all(limit: int = 10000):
         conn.close()
 
     return [dict(zip(columns, row)) for row in rows]
+
+
+@app.post("/tenders-v2")
+def get_tenders_v2(payload: CompanyProfilePayload):
+    try:
+        company_profile = profile_for_scoring(payload)
+
+        upsert_company_profile(payload.profile_name, company_profile)
+
+        tenders = fetch_ranked_tenders(payload.profile_name, limit=1000)
+        tenders = apply_stage_a_filters(tenders, company_profile)
+
+        results = [
+            enrich_tender_with_score(tender, company_profile)
+            for tender in tenders
+        ]
+
+        results.sort(
+            key=lambda x: (
+                x.get("pre_score_v2", 0),
+                x.get("semantic_similarity", 0),
+            ),
+            reverse=True,
+        )
+
+        return results[:10000]
+    except Exception as e:
+        return {"error": "tenders_v2_error", "details": str(e)}
+
