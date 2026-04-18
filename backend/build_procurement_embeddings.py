@@ -2,6 +2,7 @@ import hashlib
 import psycopg
 from psycopg.rows import dict_row
 from sentence_transformers import SentenceTransformer
+import os
 
 MODEL_NAME = "all-MiniLM-L6-v2"
 model = SentenceTransformer(MODEL_NAME)
@@ -44,7 +45,7 @@ def embed(text: str):
 
 
 def main():
-    conn = psycopg.connect("postgresql://localhost:5432/tenderzilla")
+    conn = psycopg.connect(os.environ["DATABASE_URL"])
 
     # ---- 1. Берём только live procurements
     with conn.cursor(row_factory=dict_row) as cur:

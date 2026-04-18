@@ -5,6 +5,7 @@ import math
 import time
 import random
 from datetime import datetime, timedelta, timezone
+import os
 
 from normalizer import normalize_release
 
@@ -17,7 +18,7 @@ API_URL = "https://www.find-tender.service.gov.uk/api/1.0/ocdsReleasePackages"
 # -----------------------------
 
 def get_connection():
-    return psycopg.connect("postgresql://localhost:5432/tenderzilla")
+    return psycopg.connect(os.environ["DATABASE_URL"])
 
 
 # -----------------------------

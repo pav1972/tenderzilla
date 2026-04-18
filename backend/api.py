@@ -5,6 +5,7 @@ import psycopg
 import re
 from typing import List, Optional
 from datetime import datetime, timezone
+import os
 
 from embedding_model import embed_text, MODEL_NAME
 from profile_serializer import build_profile_text
@@ -31,7 +32,7 @@ app.add_middleware(
 
 
 def get_connection():
-    return psycopg.connect("postgresql://localhost:5432/tenderzilla")
+    return psycopg.connect(os.environ["DATABASE_URL"])
 
 
 # -----------------------------
