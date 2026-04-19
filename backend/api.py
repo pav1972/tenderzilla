@@ -1,19 +1,24 @@
-import os
-import re
-from datetime import datetime, timezone
-from typing import List, Optional
-
-import psycopg
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
+import psycopg
+import re
+from typing import List, Optional
+from datetime import datetime, timezone
+
+from embedding_model import embed_text, MODEL_NAME
+from profile_serializer import build_profile_text
+from pre_score_v2 import compute_pre_score_v2
 
 
 app = FastAPI()
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=[
+        "http://127.0.0.1:5500",
+        "http://localhost:5500",
+    ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -26,10 +31,7 @@ app.add_middleware(
 
 
 def get_connection():
-    database_url = os.getenv("DATABASE_URL")
-    if not database_url:
-        raise RuntimeError("DATABASE_URL is not set")
-    return psycopg.connect(database_url)
+    return psycopg.connect("postgresql://localhost:5432/tenderzilla")
 
 
 # -----------------------------
@@ -78,7 +80,7 @@ INDUSTRY_CPV_PREFIXES = {
 
 
 # -----------------------------
-# SAFE HELPERS
+# HELPERS
 # -----------------------------
 
 
@@ -125,6 +127,10 @@ def payload_to_dict(payload: CompanyProfilePayload) -> dict:
 
 
 def profile_for_scoring(payload: CompanyProfilePayload) -> dict:
+    """
+    Return only scoring-relevant profile fields.
+    Excludes profile_name from embedding/scoring text.
+    """
     data = payload_to_dict(payload)
     return {
         "core_capabilities": data.get("core_capabilities", []),
@@ -144,6 +150,9 @@ def canonical_region_option(region_value: str) -> str:
 
 
 def tender_matches_region_bucket(region: str, selected_region: str) -> bool:
+    """
+    Map raw tender regions into the 4 frontend region options.
+    """
     region_raw = str(region or "").strip()
     region_norm = normalize_text(region_raw)
     selected_norm = normalize_text(selected_region)
@@ -180,6 +189,11 @@ def tender_matches_region_bucket(region: str, selected_region: str) -> bool:
 
 
 def passes_region_filter(tender: dict, preferred_regions: List[str]) -> bool:
+    """
+    Stage A hard filter for frontend region buckets.
+    Multi-select supported: any selected region bucket may match.
+    Empty selection = pass through.
+    """
     if not preferred_regions:
         return True
 
@@ -192,6 +206,9 @@ def passes_region_filter(tender: dict, preferred_regions: List[str]) -> bool:
 
 
 def tender_matches_industry_bucket(cpv_code: str, selected_industry: str) -> bool:
+    """
+    Prefix-based CPV matching for frontend industry buckets.
+    """
     cpv = normalize_cpv_code(cpv_code)
     industry_norm = normalize_text(selected_industry)
 
@@ -203,6 +220,10 @@ def tender_matches_industry_bucket(cpv_code: str, selected_industry: str) -> boo
 
 
 def get_matching_industry_buckets(cpv_code: str, selected_industries: List[str]) -> List[str]:
+    """
+    Multi-match helper:
+    a single CPV may match more than one selected frontend industry bucket.
+    """
     matches = []
 
     for item in selected_industries or []:
@@ -221,6 +242,11 @@ def get_matching_industry_buckets(cpv_code: str, selected_industries: List[str])
 
 
 def passes_industry_filter(tender: dict, industry_focus: List[str]) -> bool:
+    """
+    Stage A hard filter for industry buckets using CPV prefix logic.
+    Multi-select supported: any selected industry may match.
+    Empty selection = pass through.
+    """
     if not industry_focus:
         return True
 
@@ -230,6 +256,11 @@ def passes_industry_filter(tender: dict, industry_focus: List[str]) -> bool:
 
 
 def passes_value_filter(tender: dict, acceptable_min_tender_value: Optional[float]) -> bool:
+    """
+    Stage A hard filter for minimum tender value.
+    Empty value in profile = pass through.
+    Missing tender value fails only when a minimum was explicitly set.
+    """
     if acceptable_min_tender_value in (None, ""):
         return True
 
@@ -244,6 +275,12 @@ def passes_value_filter(tender: dict, acceptable_min_tender_value: Optional[floa
 
 
 def passes_deadline_filter(tender: dict, closing_within_days: Optional[int]) -> bool:
+    """
+    Stage A hard filter for deadline window.
+    Empty window in profile = pass through.
+    Missing/invalid deadline fails only when a window was explicitly set.
+    Expired tenders fail.
+    """
     if closing_within_days in (None, ""):
         return True
 
@@ -265,7 +302,94 @@ def passes_deadline_filter(tender: dict, closing_within_days: Optional[int]) -> 
     return days_left <= max_days
 
 
+def upsert_company_profile(profile_name: str, profile_data: dict) -> None:
+    """
+    Build profile text, embed it locally, and store it in company_profiles.
+    """
+    profile_text = build_profile_text(profile_data)
+    vector = embed_text(profile_text)
+
+    conn = get_connection()
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO company_profiles (
+                profile_name,
+                profile_text,
+                embedding_model,
+                embedding,
+                updated_at
+            )
+            VALUES (%s, %s, %s, %s, NOW())
+            ON CONFLICT (profile_name)
+            DO UPDATE SET
+                profile_text = EXCLUDED.profile_text,
+                embedding_model = EXCLUDED.embedding_model,
+                embedding = EXCLUDED.embedding,
+                updated_at = NOW()
+            """,
+            (
+                profile_name,
+                profile_text,
+                MODEL_NAME,
+                vector,
+            ),
+        )
+    conn.commit()
+    conn.close()
+
+
+def fetch_ranked_tenders(profile_name: str, limit: int = 200) -> list[dict]:
+    """
+    Return live tenders ranked by vector similarity to the selected company profile.
+    """
+    conn = get_connection()
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT
+                p.ocid,
+                p.title,
+                p.description,
+                p.buyer_name,
+                p.latest_notice_type,
+                p.deadline,
+                p.value_amount,
+                p.value_currency,
+                p.value_amount AS value,
+                p.cpv_code,
+                p.cpv_description,
+                p.region,
+                p.submission_url,
+                1 - (pe.embedding <=> cp.embedding) AS semantic_similarity
+            FROM procurements p
+            JOIN procurement_embeddings pe
+              ON pe.ocid = p.ocid
+            JOIN company_profiles cp
+              ON cp.profile_name = %s
+            WHERE p.is_live = TRUE
+              AND pe.embedding IS NOT NULL
+              AND cp.embedding IS NOT NULL
+            ORDER BY pe.embedding <=> cp.embedding
+            LIMIT %s
+            """,
+            (profile_name, limit),
+        )
+        rows = cur.fetchall()
+        columns = [d.name for d in cur.description]
+    conn.close()
+
+    return [dict(zip(columns, row)) for row in rows]
+
+
 def apply_stage_a_filters(tenders: list[dict], company_profile: dict) -> list[dict]:
+    """
+    Apply Stage A hard filters cleanly before scoring:
+    - region bucket filter
+    - industry bucket filter via CPV prefixes
+    - minimum tender value
+    - closing within days
+    """
     preferred_regions = company_profile.get("preferred_regions", []) or []
     industry_focus = company_profile.get("industry_focus", []) or []
     acceptable_min_tender_value = company_profile.get("acceptable_min_tender_value")
@@ -286,96 +410,35 @@ def apply_stage_a_filters(tenders: list[dict], company_profile: dict) -> list[di
     return filtered
 
 
-
-def fetch_live_tenders(limit: int = 500) -> list[dict]:
-    conn = get_connection()
-    try:
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                SELECT
-                    p.ocid,
-                    p.title,
-                    p.description,
-                    p.buyer_name,
-                    p.latest_notice_type,
-                    p.deadline,
-                    p.value_amount,
-                    p.value_currency,
-                    p.value_amount AS value,
-                    p.cpv_code,
-                    p.cpv_description,
-                    p.region,
-                    p.submission_url
-                FROM procurements p
-                WHERE p.is_live = TRUE
-                  AND p.latest_notice_type = 'TENDER'
-                ORDER BY p.deadline ASC NULLS LAST
-                LIMIT %s
-                """,
-                (limit,),
-            )
-            rows = cur.fetchall()
-            columns = [d.name for d in cur.description]
-    finally:
-        conn.close()
-
-    return [dict(zip(columns, row)) for row in rows]
-
-
-def fallback_score(tender: dict) -> dict:
-    tender["pre_score_v2"] = 0
-    tender["fit_band"] = "Not scored"
-    tender["notes"] = ["Temporary fallback scoring on free Render"]
-    tender["semantic_similarity"] = 0
-    tender["pre_score_breakdown"] = {}
-    tender["matched_core_capabilities"] = []
-    tender["matched_secondary_capabilities"] = []
-    tender["matched_industry_focus"] = []
-    tender["matched_technologies_vendors"] = []
-    tender["matched_regions"] = []
-    tender["triggered_exclusions"] = []
-    return tender
-
-
 def enrich_tender_with_score(tender: dict, company_profile: dict) -> dict:
-    try:
-        try:
-            from .pre_score_v2 import compute_pre_score_v2
-        except ImportError:
-            from pre_score_v2 import compute_pre_score_v2
+    similarity = float(tender.get("semantic_similarity") or 0)
 
-        tender["semantic_similarity"] = 0
-        scored = compute_pre_score_v2(
-            tender=tender,
-            company_profile=company_profile,
-            semantic_similarity=0,
-        )
+    scored = compute_pre_score_v2(
+        tender=tender,
+        company_profile=company_profile,
+        semantic_similarity=similarity,
+    )
 
-        tender["pre_score_v2"] = scored["pre_score_v2"]
-        tender["fit_band"] = scored.get("fit_band")
-        tender["pre_score_breakdown"] = scored["breakdown"]
-        tender["notes"] = scored["notes"]
-        tender["matched_core_capabilities"] = scored.get(
-            "matched_core_capabilities", []
-        )
-        tender["matched_secondary_capabilities"] = scored.get(
-            "matched_secondary_capabilities", []
-        )
-        tender["matched_industry_focus"] = scored.get(
-            "matched_industry_focus", []
-        )
-        tender["matched_technologies_vendors"] = scored.get(
-            "matched_technologies_vendors", []
-        )
-        tender["matched_regions"] = scored.get("matched_regions", [])
-        tender["triggered_exclusions"] = scored.get("triggered_exclusions", [])
-        return tender
-    except Exception:
-        return fallback_score(tender)
+    tender["pre_score_v2"] = scored["pre_score_v2"]
+    tender["fit_band"] = scored.get("fit_band")
+    tender["pre_score_breakdown"] = scored["breakdown"]
+    tender["notes"] = scored["notes"]
+    tender["matched_core_capabilities"] = scored.get(
+        "matched_core_capabilities", []
+    )
+    tender["matched_secondary_capabilities"] = scored.get(
+        "matched_secondary_capabilities", []
+    )
+    tender["matched_industry_focus"] = scored.get(
+        "matched_industry_focus", []
+    )
+    tender["matched_technologies_vendors"] = scored.get(
+        "matched_technologies_vendors", []
+    )
+    tender["matched_regions"] = scored.get("matched_regions", [])
+    tender["triggered_exclusions"] = scored.get("triggered_exclusions", [])
 
-
-# TODO: restore full embedding-based ranking in a paid/stable Render environment.
+    return tender
 
 
 # -----------------------------
@@ -383,95 +446,72 @@ def enrich_tender_with_score(tender: dict, company_profile: dict) -> dict:
 # -----------------------------
 
 
-@app.get("/")
-def root():
-    return {"message": "TenderZilla API is running"}
-
-
 @app.get("/health")
 def health():
-    return {"status": "ok", "service": "tenderzilla-api"}
-
-
-@app.get("/test")
-def test():
-    return {"test": "success", "message": "API is working correctly"}
-
-
-@app.get("/db-test")
-def db_test():
-    try:
-        conn = get_connection()
-        try:
-            with conn.cursor() as cur:
-                cur.execute("SELECT 1")
-                result = cur.fetchone()[0]
-        finally:
-            conn.close()
-        return {"db": "ok", "result": result}
-    except Exception as e:
-        return {"db": "error", "details": str(e)}
+    return {"status": "ok", "engine": "vector_pre_score_v2"}
 
 
 @app.get("/tenders-all")
 def get_tenders_all(limit: int = 10000):
     conn = get_connection()
-    try:
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                SELECT
-                    p.ocid,
-                    p.title,
-                    p.description,
-                    p.buyer_name,
-                    p.latest_notice_type,
-                    p.deadline,
-                    p.value_amount,
-                    p.value_currency,
-                    p.value_amount AS value,
-                    p.cpv_code,
-                    p.cpv_description,
-                    p.region,
-                    p.submission_url
-                FROM procurements p
-                WHERE p.is_live = TRUE
-                  AND p.latest_notice_type = 'TENDER'
-                ORDER BY p.deadline ASC NULLS LAST
-                LIMIT %s
-                """,
-                (limit,),
-            )
-            rows = cur.fetchall()
-            columns = [d.name for d in cur.description]
-    finally:
-        conn.close()
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT
+                p.ocid,
+                p.title,
+                p.description,
+                p.buyer_name,
+                p.latest_notice_type,
+                p.deadline,
+                p.value_amount,
+                p.value_currency,
+                p.value_amount AS value,
+                p.cpv_code,
+                p.cpv_description,
+                p.region,
+                p.submission_url
+            FROM procurements p
+            WHERE p.is_live = TRUE
+              AND p.latest_notice_type = 'TENDER'
+            ORDER BY p.deadline ASC NULLS LAST
+            LIMIT %s
+            """,
+            (limit,),
+        )
+        rows = cur.fetchall()
+        columns = [d.name for d in cur.description]
+    conn.close()
 
     return [dict(zip(columns, row)) for row in rows]
 
 
 @app.post("/tenders-v2")
 def get_tenders_v2(payload: CompanyProfilePayload):
-    try:
-        company_profile = profile_for_scoring(payload)
+    company_profile = profile_for_scoring(payload)
 
-        tenders = fetch_live_tenders(limit=500)
-        tenders = apply_stage_a_filters(tenders, company_profile)
+    # 1. Save / update profile embedding
+    upsert_company_profile(payload.profile_name, company_profile)
 
-        results = [
-            enrich_tender_with_score(tender, company_profile)
-            for tender in tenders
-        ]
+    # 2. Fetch semantically ranked tenders
+    tenders = fetch_ranked_tenders(payload.profile_name, limit=1000)
 
-        results.sort(
-            key=lambda x: (
-                x.get("pre_score_v2", 0),
-                x.get("semantic_similarity", 0),
-            ),
-            reverse=True,
-        )
+    # 3. Apply Stage A hard filters before scoring
+    tenders = apply_stage_a_filters(tenders, company_profile)
 
-        return results[:10000]
-    except Exception as e:
-        return {"error": "tenders_v2_error", "details": str(e)}
+    # 4. Apply v2 scoring layer
+    results = [
+        enrich_tender_with_score(tender, company_profile)
+        for tender in tenders
+    ]
 
+    # 5. Sort by final score, then semantic similarity
+    results.sort(
+        key=lambda x: (
+            x.get("pre_score_v2", 0),
+            x.get("semantic_similarity", 0),
+        ),
+        reverse=True,
+    )
+
+    return results[:10000]
