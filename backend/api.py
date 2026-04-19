@@ -1,14 +1,13 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
+import hashlib
+import json
+import os
 import psycopg
 import re
 from typing import List, Optional
 from datetime import datetime, timezone
-
-from embedding_model import embed_text, MODEL_NAME
-from profile_serializer import build_profile_text
-from pre_score_v2 import compute_pre_score_v2
 
 
 app = FastAPI()
@@ -31,7 +30,10 @@ app.add_middleware(
 
 
 def get_connection():
-    return psycopg.connect("postgresql://localhost:5432/tenderzilla")
+    database_url = os.getenv("DATABASE_URL")
+    if not database_url:
+        database_url = "postgresql://localhost:5432/tenderzilla"
+    return psycopg.connect(database_url)
 
 
 # -----------------------------
@@ -42,12 +44,12 @@ def get_connection():
 class CompanyProfilePayload(BaseModel):
     profile_name: str = "default"
 
-    core_capabilities: List[str] = []
-    secondary_capabilities: List[str] = []
-    industry_focus: List[str] = []
-    technologies_vendors: List[str] = []
-    excluded_sectors: List[str] = []
-    preferred_regions: List[str] = []
+    core_capabilities: List[str] = Field(default_factory=list)
+    secondary_capabilities: List[str] = Field(default_factory=list)
+    industry_focus: List[str] = Field(default_factory=list)
+    technologies_vendors: List[str] = Field(default_factory=list)
+    excluded_sectors: List[str] = Field(default_factory=list)
+    preferred_regions: List[str] = Field(default_factory=list)
 
     acceptable_min_tender_value: Optional[float] = None
     closing_within_days: Optional[int] = None
@@ -126,27 +128,57 @@ def payload_to_dict(payload: CompanyProfilePayload) -> dict:
     return payload.dict()
 
 
-def profile_for_scoring(payload: CompanyProfilePayload) -> dict:
-    """
-    Return only scoring-relevant profile fields.
-    Excludes profile_name from embedding/scoring text.
-    """
+def _clean_list(value) -> list[str]:
+    if not value:
+        return []
+    return [str(item).strip() for item in value if str(item or "").strip()]
+
+
+def build_profile_record(payload: CompanyProfilePayload) -> dict:
     data = payload_to_dict(payload)
     return {
-        "core_capabilities": data.get("core_capabilities", []),
-        "secondary_capabilities": data.get("secondary_capabilities", []),
-        "industry_focus": data.get("industry_focus", []),
-        "technologies_vendors": data.get("technologies_vendors", []),
-        "excluded_sectors": data.get("excluded_sectors", []),
-        "preferred_regions": data.get("preferred_regions", []),
+        "core_capabilities": _clean_list(data.get("core_capabilities", [])),
+        "secondary_capabilities": _clean_list(data.get("secondary_capabilities", [])),
+        "industry_focus": _clean_list(data.get("industry_focus", [])),
+        "technologies_vendors": _clean_list(data.get("technologies_vendors", [])),
+        "excluded_sectors": _clean_list(data.get("excluded_sectors", [])),
+        "preferred_regions": _clean_list(data.get("preferred_regions", [])),
         "acceptable_min_tender_value": data.get("acceptable_min_tender_value"),
         "closing_within_days": data.get("closing_within_days"),
     }
 
 
-def canonical_region_option(region_value: str) -> str:
-    region_norm = normalize_text(region_value)
-    return FRONTEND_REGION_OPTIONS.get(region_norm, str(region_value or "").strip())
+def _stable_embedding_values(value) -> list[str]:
+    cleaned = _clean_list(value)
+    deduped = {}
+    for item in cleaned:
+        key = item.casefold()
+        if key not in deduped:
+            deduped[key] = item
+    return [deduped[key] for key in sorted(deduped)]
+
+
+def build_profile_text(profile_data: dict) -> str:
+    parts = []
+
+    core_capabilities = _stable_embedding_values(profile_data.get("core_capabilities"))
+    technologies_vendors = _stable_embedding_values(profile_data.get("technologies_vendors"))
+    secondary_capabilities = _stable_embedding_values(profile_data.get("secondary_capabilities"))
+
+    if core_capabilities:
+        parts.append("Core capabilities: " + ", ".join(core_capabilities))
+
+    if technologies_vendors:
+        parts.append("Technologies/vendors: " + ", ".join(technologies_vendors))
+
+    if secondary_capabilities:
+        parts.append("Secondary capabilities: " + ", ".join(secondary_capabilities))
+
+    return "\n".join(parts)
+
+
+def compute_profile_hash(profile_text: str) -> str:
+    return hashlib.sha256(profile_text.encode("utf-8")).hexdigest()
 
 
 def tender_matches_region_bucket(region: str, selected_region: str) -> bool:
@@ -302,41 +334,139 @@ def passes_deadline_filter(tender: dict, closing_within_days: Optional[int]) -> 
     return days_left <= max_days
 
 
-def upsert_company_profile(profile_name: str, profile_data: dict) -> None:
-    """
-    Build profile text, embed it locally, and store it in company_profiles.
-    """
+def get_existing_profile(profile_name: str) -> dict | None:
+    conn = get_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT
+                    profile_name,
+                    core_capabilities,
+                    secondary_capabilities,
+                    industry_focus,
+                    technologies_vendors,
+                    excluded_sectors,
+                    preferred_regions,
+                    acceptable_min_tender_value,
+                    closing_within_days,
+                    profile_text,
+                    profile_hash,
+                    embedding_model,
+                    embedding
+                FROM company_profiles
+                WHERE profile_name = %s
+                """,
+                (profile_name,),
+            )
+            row = cur.fetchone()
+            if not row:
+                return None
+            columns = [d.name for d in cur.description]
+            return dict(zip(columns, row))
+    finally:
+        conn.close()
+
+
+def _json_for_db(value) -> str:
+    return json.dumps(value or [])
+
+
+def upsert_company_profile_if_changed(profile_name: str, profile_data: dict) -> dict:
     profile_text = build_profile_text(profile_data)
+    profile_hash = compute_profile_hash(profile_text)
+    existing_profile = get_existing_profile(profile_name)
+
+    if (
+        existing_profile
+        and existing_profile.get("profile_hash") == profile_hash
+        and existing_profile.get("embedding") is not None
+    ):
+        print("Profile unchanged, reusing existing embedding")
+        return {
+            "profile_text": profile_text,
+            "profile_hash": profile_hash,
+            "embedding": existing_profile.get("embedding"),
+            "embedding_model": existing_profile.get("embedding_model"),
+            "changed": False,
+        }
+
+    print("Profile changed, recomputing embedding")
+    try:
+        from .embedding_model import MODEL_NAME, embed_text
+    except ImportError:
+        from embedding_model import MODEL_NAME, embed_text
+
     vector = embed_text(profile_text)
 
     conn = get_connection()
-    with conn.cursor() as cur:
-        cur.execute(
-            """
-            INSERT INTO company_profiles (
-                profile_name,
-                profile_text,
-                embedding_model,
-                embedding,
-                updated_at
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO company_profiles (
+                    profile_name,
+                    core_capabilities,
+                    secondary_capabilities,
+                    industry_focus,
+                    technologies_vendors,
+                    excluded_sectors,
+                    preferred_regions,
+                    acceptable_min_tender_value,
+                    closing_within_days,
+                    profile_text,
+                    profile_hash,
+                    embedding_model,
+                    embedding,
+                    updated_at
+                )
+                VALUES (
+                    %s, %s::jsonb, %s::jsonb, %s::jsonb, %s::jsonb, %s::jsonb, %s::jsonb,
+                    %s, %s, %s, %s, %s, %s, NOW()
+                )
+                ON CONFLICT (profile_name)
+                DO UPDATE SET
+                    core_capabilities = EXCLUDED.core_capabilities,
+                    secondary_capabilities = EXCLUDED.secondary_capabilities,
+                    industry_focus = EXCLUDED.industry_focus,
+                    technologies_vendors = EXCLUDED.technologies_vendors,
+                    excluded_sectors = EXCLUDED.excluded_sectors,
+                    preferred_regions = EXCLUDED.preferred_regions,
+                    acceptable_min_tender_value = EXCLUDED.acceptable_min_tender_value,
+                    closing_within_days = EXCLUDED.closing_within_days,
+                    profile_text = EXCLUDED.profile_text,
+                    profile_hash = EXCLUDED.profile_hash,
+                    embedding_model = EXCLUDED.embedding_model,
+                    embedding = EXCLUDED.embedding,
+                    updated_at = NOW()
+                """,
+                (
+                    profile_name,
+                    _json_for_db(profile_data.get("core_capabilities")),
+                    _json_for_db(profile_data.get("secondary_capabilities")),
+                    _json_for_db(profile_data.get("industry_focus")),
+                    _json_for_db(profile_data.get("technologies_vendors")),
+                    _json_for_db(profile_data.get("excluded_sectors")),
+                    _json_for_db(profile_data.get("preferred_regions")),
+                    profile_data.get("acceptable_min_tender_value"),
+                    profile_data.get("closing_within_days"),
+                    profile_text,
+                    profile_hash,
+                    MODEL_NAME,
+                    vector,
+                ),
             )
-            VALUES (%s, %s, %s, %s, NOW())
-            ON CONFLICT (profile_name)
-            DO UPDATE SET
-                profile_text = EXCLUDED.profile_text,
-                embedding_model = EXCLUDED.embedding_model,
-                embedding = EXCLUDED.embedding,
-                updated_at = NOW()
-            """,
-            (
-                profile_name,
-                profile_text,
-                MODEL_NAME,
-                vector,
-            ),
-        )
-    conn.commit()
-    conn.close()
+        conn.commit()
+    finally:
+        conn.close()
+
+    return {
+        "profile_text": profile_text,
+        "profile_hash": profile_hash,
+        "embedding": vector,
+        "embedding_model": MODEL_NAME,
+        "changed": True,
+    }
 
 
 def fetch_ranked_tenders(profile_name: str, limit: int = 200) -> list[dict]:
@@ -411,6 +541,11 @@ def apply_stage_a_filters(tenders: list[dict], company_profile: dict) -> list[di
 
 
 def enrich_tender_with_score(tender: dict, company_profile: dict) -> dict:
+    try:
+        from .pre_score_v2 import compute_pre_score_v2
+    except ImportError:
+        from pre_score_v2 import compute_pre_score_v2
+
     similarity = float(tender.get("semantic_similarity") or 0)
 
     scored = compute_pre_score_v2(
@@ -488,10 +623,12 @@ def get_tenders_all(limit: int = 10000):
 
 @app.post("/tenders-v2")
 def get_tenders_v2(payload: CompanyProfilePayload):
-    company_profile = profile_for_scoring(payload)
+    company_profile = build_profile_record(payload)
 
-    # 1. Save / update profile embedding
-    upsert_company_profile(payload.profile_name, company_profile)
+    # 1. Save/update profile embedding only when profile hash changes
+    upsert_company_profile_if_changed(payload.profile_name, company_profile)
+
+    print(f"Matching tenders for profile: {payload.profile_name}")
 
     # 2. Fetch semantically ranked tenders
     tenders = fetch_ranked_tenders(payload.profile_name, limit=1000)
