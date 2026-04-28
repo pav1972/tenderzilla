@@ -108,6 +108,61 @@ def safe_get(url, params=None, timeout=60, max_retries=10):
             attempt += 1
 
 
+def safe_get_json(url, params=None, timeout=60, max_retries=10):
+    attempt = 0
+
+    while True:
+        try:
+            response = requests.get(url, params=params, timeout=timeout)
+
+            if response.status_code == 429:
+                if attempt >= max_retries:
+                    response.raise_for_status()
+
+                retry_after = response.headers.get("Retry-After")
+                if retry_after:
+                    try:
+                        wait_time = max(float(retry_after), 10.0)
+                    except ValueError:
+                        wait_time = 15.0
+                else:
+                    wait_time = min(180, (2 ** attempt) * 5 + random.uniform(2, 6))
+
+                print(f"429 rate limit. Sleeping {wait_time:.1f}s...")
+                time.sleep(wait_time)
+                attempt += 1
+                continue
+
+            response.raise_for_status()
+
+            try:
+                return response.json()
+            except requests.exceptions.JSONDecodeError as e:
+                if attempt >= max_retries:
+                    raise
+
+                wait_time = min(180, (2 ** attempt) * 5 + random.uniform(2, 6))
+                content_type = response.headers.get("Content-Type", "")
+                preview = (response.text or "")[:400].replace("\n", " ")
+                print(
+                    f"JSON decode failed. Retrying... attempt {attempt + 1}/{max_retries}; "
+                    f"wait {wait_time:.1f}s; status={response.status_code}; "
+                    f"content_type={content_type}; preview={preview!r}"
+                )
+                time.sleep(wait_time)
+                attempt += 1
+                continue
+
+        except requests.exceptions.RequestException as e:
+            if attempt >= max_retries:
+                raise
+
+            wait_time = min(180, (2 ** attempt) * 5 + random.uniform(2, 6))
+            print(f"Request error: {e}. Retry in {wait_time:.1f}s...")
+            time.sleep(wait_time)
+            attempt += 1
+
+
 def format_api_datetime(value):
     return value.replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
@@ -135,9 +190,9 @@ def fetch_releases(run_started_at):
     all_releases = []
     url = API_URL
     params = {
-        # 100 keeps daily cron runs efficient while still using cursor pagination
-        # and polite pauses to avoid hammering Find-a-Tender.
-        "limit": 100,
+        # 50 reduces the chance of truncated or malformed response bodies
+        # while still using cursor pagination to fetch the full result set.
+        "limit": 50,
         "updatedFrom": updated_from_str,
         "updatedTo": updated_to_str,
     }
@@ -145,8 +200,7 @@ def fetch_releases(run_started_at):
 
     while True:
         print(f"Fetching page {page}...")
-        response = safe_get(url, params=params)
-        data = response.json()
+        data = safe_get_json(url, params=params)
 
         releases = data.get("releases", [])
         all_releases.extend(releases)
