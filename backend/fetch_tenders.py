@@ -70,44 +70,6 @@ def clean_json_values(obj):
 # SAFE REQUEST
 # -----------------------------
 
-def safe_get(url, params=None, timeout=60, max_retries=10):
-    attempt = 0
-
-    while True:
-        try:
-            response = requests.get(url, params=params, timeout=timeout)
-
-            if response.status_code == 429:
-                if attempt >= max_retries:
-                    response.raise_for_status()
-
-                retry_after = response.headers.get("Retry-After")
-                if retry_after:
-                    try:
-                        wait_time = max(float(retry_after), 10.0)
-                    except ValueError:
-                        wait_time = 15.0
-                else:
-                    wait_time = min(180, (2 ** attempt) * 5 + random.uniform(2, 6))
-
-                print(f"429 rate limit. Sleeping {wait_time:.1f}s...")
-                time.sleep(wait_time)
-                attempt += 1
-                continue
-
-            response.raise_for_status()
-            return response
-
-        except requests.exceptions.RequestException as e:
-            if attempt >= max_retries:
-                raise
-
-            wait_time = min(180, (2 ** attempt) * 5 + random.uniform(2, 6))
-            print(f"Request error: {e}. Retry in {wait_time:.1f}s...")
-            time.sleep(wait_time)
-            attempt += 1
-
-
 def safe_get_json(url, params=None, timeout=60, max_retries=10):
     attempt = 0
 
@@ -137,7 +99,7 @@ def safe_get_json(url, params=None, timeout=60, max_retries=10):
 
             try:
                 return response.json()
-            except requests.exceptions.JSONDecodeError as e:
+            except requests.exceptions.JSONDecodeError:
                 if attempt >= max_retries:
                     raise
 
@@ -171,54 +133,49 @@ def format_api_datetime(value):
 # FETCH FROM API
 # -----------------------------
 
-def fetch_releases(run_started_at):
-    last_run = get_last_run()
+def build_daily_windows(start, end):
+    windows = []
+    current = start
 
-    if last_run:
-        # Keep a 1-day safety overlap so notices updated near the checkpoint
-        # boundary are not missed. Inserts/upserts below keep the run idempotent.
-        updated_from = last_run - timedelta(days=1)
-    else:
-        updated_from = run_started_at - timedelta(days=7)
+    while current < end:
+        window_end = min(current + timedelta(days=1), end)
+        windows.append((current, window_end))
+        current = window_end
 
-    updated_from_str = format_api_datetime(updated_from)
-    updated_to_str = format_api_datetime(run_started_at)
+    return windows
 
-    print(f"Checkpoint last_run_utc: {last_run}")
-    print(f"Fetching releases updated from {updated_from_str} to {updated_to_str}")
 
-    all_releases = []
+def fetch_releases_for_window(window_start, window_end, window_number, window_attempt):
+    print(f"Window {window_number} attempt {window_attempt}/2")
+
+    releases_for_window = []
     url = API_URL
     params = {
-        # 50 reduces the chance of truncated or malformed response bodies
-        # while still using cursor pagination to fetch the full result set.
         "limit": 50,
-        "updatedFrom": updated_from_str,
-        "updatedTo": updated_to_str,
+        "updatedFrom": format_api_datetime(window_start),
+        "updatedTo": format_api_datetime(window_end),
     }
     page = 1
 
     while True:
-        print(f"Fetching page {page}...")
+        print(f"Window {window_number} page {page}...")
         data = safe_get_json(url, params=params)
 
         releases = data.get("releases", [])
-        all_releases.extend(releases)
-        print(f"Page {page}: fetched {len(releases)} releases")
+        releases_for_window.extend(releases)
+        print(f"Window {window_number} page {page}: fetched {len(releases)} releases")
 
         next_link = data.get("links", {}).get("next")
         if not next_link:
             break
 
-        # Find-a-Tender uses cursor-based pagination. Follow links.next as-is
-        # instead of rebuilding query params.
         url = next_link
         params = None
         page += 1
         time.sleep(random.uniform(2, 4))
 
-    print(f"Total releases fetched: {len(all_releases)}")
-    return all_releases
+    print(f"Window {window_number}: fetched total {len(releases_for_window)} releases")
+    return releases_for_window
 
 
 # -----------------------------
@@ -410,22 +367,14 @@ def upsert_procurement(cur, p):
 
 
 # -----------------------------
-# MAIN INGEST
+# PROCESS WINDOW
 # -----------------------------
 
-def run_ingestion():
-    run_started_at = datetime.now(timezone.utc)
-
-    try:
-        releases = fetch_releases(run_started_at)
-    except Exception as e:
-        print(f"Fatal fetch failure; checkpoint not updated: {e}")
-        raise
-
+def process_releases_for_window(releases, window_number):
     conn = get_connection()
     cur = conn.cursor()
 
-    count = 0
+    processed = 0
     failed = 0
 
     try:
@@ -440,25 +389,107 @@ def run_ingestion():
                 upsert_procurement(cur, procurement)
 
                 conn.commit()
-                count += 1
-
-                if count % 100 == 0:
-                    print(f"Processed {count} releases")
+                processed += 1
 
             except Exception as e:
                 failed += 1
                 conn.rollback()
                 cur = conn.cursor()
                 release_id = r.get("id") or r.get("ocid") or "unknown"
-                print(f"Error processing release {release_id}: {e}")
+                print(f"Window {window_number}: error processing release {release_id}: {e}")
     finally:
         conn.close()
 
-    if failed == 0:
-        update_last_run(run_started_at)
-        print(f"Ingested {count} records; failed {failed}; checkpoint updated to {format_api_datetime(run_started_at)}")
+    print(
+        f"Window {window_number}: processed {processed} releases; "
+        f"failed release records {failed}"
+    )
+    return processed, failed
+
+
+# -----------------------------
+# MAIN INGEST
+# -----------------------------
+
+def run_ingestion():
+    run_started_at = datetime.now(timezone.utc)
+    last_run = get_last_run()
+
+    if last_run:
+        start = last_run - timedelta(days=1)
     else:
-        print(f"Ingested {count} records; failed {failed}; checkpoint not advanced because some records failed")
+        start = run_started_at - timedelta(days=7)
+
+    end = run_started_at
+
+    print(f"Checkpoint last_run_utc: {last_run}")
+    print(f"Overall ingestion period: {format_api_datetime(start)} -> {format_api_datetime(end)}")
+
+    windows = build_daily_windows(start, end)
+    failed_windows = []
+    successful_windows = 0
+    total_processed = 0
+    total_failed_records = 0
+
+    for window_number, (window_start, window_end) in enumerate(windows, start=1):
+        print(f"=== WINDOW {window_number}: {format_api_datetime(window_start)} -> {format_api_datetime(window_end)} ===")
+
+        window_error = None
+        window_succeeded = False
+
+        for window_attempt in range(1, 3):
+            try:
+                releases = fetch_releases_for_window(
+                    window_start,
+                    window_end,
+                    window_number,
+                    window_attempt,
+                )
+                processed, failed = process_releases_for_window(releases, window_number)
+                total_processed += processed
+                total_failed_records += failed
+                successful_windows += 1
+                window_succeeded = True
+                print(
+                    f"Window {window_number}: success; fetched {len(releases)} releases; "
+                    f"processed {processed}; failed release records {failed}"
+                )
+                break
+            except Exception as e:
+                window_error = e
+                print(f"Window {window_number} attempt {window_attempt}/2 failed: {e}")
+                if window_attempt < 2:
+                    wait_time = random.uniform(30, 60)
+                    print(f"Retrying window {window_number} from page 1 in {wait_time:.1f}s...")
+                    time.sleep(wait_time)
+
+        if not window_succeeded:
+            failed_windows.append({
+                "window_number": window_number,
+                "window_start": format_api_datetime(window_start),
+                "window_end": format_api_datetime(window_end),
+                "error": str(window_error),
+            })
+
+    update_last_run(run_started_at)
+
+    print(f"Total windows attempted: {len(windows)}")
+    print(f"Successful windows: {successful_windows}")
+    print(f"Failed windows: {len(failed_windows)}")
+    print(f"Total processed records: {total_processed}")
+    print(f"Total failed release records: {total_failed_records}")
+
+    if failed_windows:
+        print("WARNING: Some ingestion windows failed. Manual backfill required.")
+        for failed_window in failed_windows:
+            print(
+                f"Failed window {failed_window['window_number']}: "
+                f"{failed_window['window_start']} -> {failed_window['window_end']} | "
+                f"error={failed_window['error']}"
+            )
+        print(f"Checkpoint updated to {format_api_datetime(run_started_at)}")
+    else:
+        print(f"Checkpoint updated to {format_api_datetime(run_started_at)}")
 
 
 # -----------------------------
